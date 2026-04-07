@@ -1,0 +1,7 @@
+Today's date is {date}. Give me a brief morning summary:
+
+1. Check my calendar for today's events (use your calendar tool if available)
+2. Check the weather forecast
+3. List any pending tasks or reminders
+
+Keep it concise — bullet points, no fluff. If nothing important, reply NO_REPLY.

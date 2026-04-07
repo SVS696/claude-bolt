@@ -1,0 +1,27 @@
+[Unit]
+Description=Claude Code Telegram Bridge
+After=network.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/claude-telegram-bridge
+ExecStart=/usr/bin/python3 /root/claude-telegram-bridge/bot.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/root/claude-telegram-bridge/.env
+Environment=PATH=/root/.local/share/fnm/node-versions/v24.13.1/installation/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=NODE_NO_WARNINGS=1
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=claude-telegram
+
+# Resource limits
+MemoryMax=1536M
+TasksMax=64
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,8 @@
+End of day summary for {date}.
+
+Review what happened today:
+1. Calendar events that took place
+2. Tasks completed
+3. Any notable system events or cron results
+
+Format with emoji status indicators. If nothing to report, reply HEARTBEAT_OK.
