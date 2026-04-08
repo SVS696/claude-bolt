@@ -650,8 +650,7 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, m
 
     try:
         actions = []  # Tool actions
-        plan_texts = []  # TEXT blocks before first ACTION (plan)
-        result_texts = []  # TEXT blocks after first ACTION (result)
+        all_texts = []  # All TEXT blocks (shown live in reply)
         had_actions = False  # Whether any ACTION was seen
         progress_msg = None  # Separate message for progress
         async for chunk in runner.run(message_text, chat_id):
@@ -670,19 +669,16 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, m
                     except asyncio.CancelledError:
                         pass
 
-                if not had_actions:
-                    # Before any tool use → plan/thinking
-                    plan_texts.append(text_chunk)
-                    now = asyncio.get_event_loop().time()
-                    if now - last_edit_time >= 0.5:
-                        display = "\n\n".join(plan_texts)
-                        if len(display) > TELEGRAM_MAX_MESSAGE_LENGTH - 50:
-                            display = "..." + display[-(TELEGRAM_MAX_MESSAGE_LENGTH - 53):]
-                        await safe_edit(reply, md_to_tg(display))
-                        last_edit_time = now
-                else:
-                    # After tool use → result
-                    result_texts.append(text_chunk)
+                all_texts.append(text_chunk)
+
+                # Always show TEXT in reply (live thinking/plan/result)
+                now = asyncio.get_event_loop().time()
+                if now - last_edit_time >= 0.5:
+                    display = "\n\n".join(all_texts)
+                    if len(display) > TELEGRAM_MAX_MESSAGE_LENGTH - 50:
+                        display = "..." + display[-(TELEGRAM_MAX_MESSAGE_LENGTH - 53):]
+                    await safe_edit(reply, md_to_tg(display))
+                    last_edit_time = now
 
             elif chunk.startswith("\x01ACTION:"):
                 had_actions = True
@@ -753,36 +749,17 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, m
         )
 
         # Final output
-        # reply = plan text (or "Думаю..." if no plan)
-        # progress_msg = deleted
-        # result = new message or replaces reply if no plan
-
-        if had_actions and result_texts:
-            result = "\n\n".join(result_texts).strip()
-            formatted = md_to_tg(result)
-            chunks = split_message(formatted)
-            if plan_texts:
-                # Plan shown in reply → keep it, result as new message
-                for ch in chunks:
-                    await safe_send(context.bot, chat_id, ch)
-            else:
-                # No plan → put result in reply (replace "Думаю...")
-                await safe_edit(reply, chunks[0])
-                for ch in chunks[1:]:
-                    await safe_send(context.bot, chat_id, ch)
-        elif had_actions and not result_texts:
-            if not plan_texts:
-                # Only actions, no text at all
-                await safe_edit(reply, "✅ Выполнено", use_html=False)
-            # else: plan in reply, nothing more to add
-        elif not had_actions and plan_texts:
-            # Simple response → finalize plan in reply
-            final = "\n\n".join(plan_texts).strip()
+        # Reply always shows all TEXT blocks (already updated live).
+        # Just do a final edit to ensure formatting is clean.
+        if all_texts:
+            final = "\n\n".join(all_texts).strip()
             formatted = md_to_tg(final)
             chunks = split_message(formatted)
             await safe_edit(reply, chunks[0])
             for ch in chunks[1:]:
                 await safe_send(context.bot, chat_id, ch)
+        elif had_actions:
+            await safe_edit(reply, "✅ Выполнено", use_html=False)
         else:
             await safe_edit(reply, "[Пустой ответ]", use_html=False)
 
