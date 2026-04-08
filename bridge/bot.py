@@ -11,13 +11,14 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.error import BadRequest
 from telegram.ext import (
     Application,
     CommandHandler,
     MessageHandler,
+    CallbackQueryHandler,
     filters,
     ContextTypes,
 )
@@ -152,7 +153,9 @@ def save_models_config(config: dict):
 def owner_only(func):
     async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if update.effective_user.id != TELEGRAM_OWNER_ID:
-            await update.message.reply_text("Access denied.")
+            msg = update.message or (update.callback_query.message if update.callback_query else None)
+            if msg:
+                await msg.reply_text("Access denied.")
             return
         return await func(update, context)
     return wrapper
@@ -226,43 +229,72 @@ def md_to_tg(text: str) -> str:
     return text
 
 
-async def safe_edit(msg, text: str, use_html: bool = True):
+def _extract_buttons(text: str) -> tuple[str, list[list[InlineKeyboardButton]] | None]:
+    """Extract inline keyboard buttons from text.
+
+    Convention: [button:Label:callback_data] in text.
+    Multiple buttons on same line = one row. Separate lines = separate rows.
+    Returns (clean_text, keyboard_rows or None).
+    """
+    button_pattern = re.compile(r'\[button:([^:]+):([^\]]+)\]')
+
+    rows = []
+    clean_lines = []
+
+    for line in text.split('\n'):
+        buttons_in_line = button_pattern.findall(line)
+        if buttons_in_line:
+            row = [InlineKeyboardButton(text=label.strip(), callback_data=data.strip())
+                   for label, data in buttons_in_line]
+            rows.append(row)
+            # Remove button markup from line, keep remaining text
+            remaining = button_pattern.sub('', line).strip()
+            if remaining:
+                clean_lines.append(remaining)
+        else:
+            clean_lines.append(line)
+
+    clean_text = '\n'.join(clean_lines)
+    return clean_text, rows if rows else None
+
+
+async def safe_edit(msg, text: str, use_html: bool = True, reply_markup=None):
     """Edit message with HTML formatting, fallback to plain."""
     try:
         if use_html:
-            await msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True)
+            await msg.edit_text(text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=reply_markup)
         else:
-            await msg.edit_text(text)
+            await msg.edit_text(text, reply_markup=reply_markup)
     except BadRequest as e:
         if "message is not modified" in str(e).lower():
-            return  # Same content, not an error
+            return
         logger.warning(f"HTML edit failed: {e}\n--- HTML was ---\n{text[:500]}\n--- end ---")
         try:
             clean = re.sub(r"<[^>]+>", "", text)
-            await msg.edit_text(clean)
+            await msg.edit_text(clean, reply_markup=reply_markup)
         except Exception:
             pass
     except Exception as e:
         logger.warning(f"Edit failed: {e}")
         try:
             clean = re.sub(r"<[^>]+>", "", text)
-            await msg.edit_text(clean)
+            await msg.edit_text(clean, reply_markup=reply_markup)
         except Exception:
             pass
 
 
-async def safe_send(bot, chat_id: int, text: str, use_html: bool = True):
+async def safe_send(bot, chat_id: int, text: str, use_html: bool = True, reply_markup=None):
     """Send message with HTML formatting, fallback to plain."""
     try:
         if use_html:
-            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True)
+            await bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML", disable_web_page_preview=True, reply_markup=reply_markup)
         else:
-            await bot.send_message(chat_id=chat_id, text=text)
+            await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup)
     except Exception as e:
         logger.warning(f"HTML send failed: {e}\n--- HTML was ---\n{text[:500]}\n--- end ---")
         try:
             clean = re.sub(r"<[^>]+>", "", text)
-            await bot.send_message(chat_id=chat_id, text=clean)
+            await bot.send_message(chat_id=chat_id, text=clean, reply_markup=reply_markup)
         except Exception as e2:
             logger.error(f"Send failed: {e2}")
 
@@ -755,10 +787,18 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, m
         if all_texts:
             final = "\n\n".join(all_texts).strip()
             formatted = md_to_tg(final) + done_tag
+            # Extract inline buttons if present
+            formatted, keyboard_rows = _extract_buttons(formatted)
+            keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
             chunks = split_message(formatted)
-            await safe_edit(reply, chunks[0])
-            for ch in chunks[1:]:
-                await safe_send(context.bot, chat_id, ch)
+            # Only attach keyboard to the last chunk
+            if len(chunks) == 1:
+                await safe_edit(reply, chunks[0], reply_markup=keyboard)
+            else:
+                await safe_edit(reply, chunks[0])
+                for ch in chunks[1:-1]:
+                    await safe_send(context.bot, chat_id, ch)
+                await safe_send(context.bot, chat_id, chunks[-1], reply_markup=keyboard)
         elif had_actions:
             await safe_edit(reply, f"<i>worked {elapsed}s</i>")
         else:
@@ -774,6 +814,168 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, m
     except Exception as e:
         stop_anim.set()
         logger.exception("Error processing message")
+        try:
+            await reply.edit_text(f"Ошибка: {e}")
+        except Exception:
+            pass
+
+
+# ─── Callback query handler ───
+
+@owner_only
+async def handle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle inline keyboard button presses."""
+    query = update.callback_query
+    await query.answer()
+
+    chat_id = update.effective_chat.id
+    callback_data = query.data
+
+    # Build context from the message that had the button
+    button_msg_text = query.message.text or ""
+    if len(button_msg_text) > 200:
+        button_msg_text = button_msg_text[:200] + "..."
+
+    prompt = f"[Нажата кнопка: {callback_data}]\n(В контексте сообщения: {button_msg_text})"
+
+    prev = _active_tasks.get(chat_id)
+    if prev and not prev.done():
+        prev.cancel()
+        await asyncio.sleep(0.3)
+
+    # Send thinking message, then process
+    reply = await context.bot.send_message(chat_id=chat_id, text="⏳ Думаю...")
+
+    task = asyncio.create_task(_process_callback(context, chat_id, prompt, reply))
+    _active_tasks[chat_id] = task
+
+
+async def _process_callback(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_text: str, reply):
+    """Process a callback button press — similar to _process_message but with pre-created reply."""
+    await context.bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+
+    stop_anim = asyncio.Event()
+    anim_task = asyncio.create_task(
+        _animate_thinking(reply, context.bot, chat_id, stop_anim)
+    )
+
+    got_first_chunk = False
+    last_edit_text = ""
+    last_edit_time = 0
+    start_time = asyncio.get_event_loop().time()
+
+    try:
+        actions = []
+        all_texts = []
+        had_actions = False
+        progress_msg = None
+        async for chunk in runner.run(message_text, chat_id):
+            if chunk.startswith("\x01TEXT:"):
+                text_chunk = chunk[6:].strip()
+                if not text_chunk:
+                    continue
+                if not got_first_chunk:
+                    got_first_chunk = True
+                    stop_anim.set()
+                    anim_task.cancel()
+                    try:
+                        await anim_task
+                    except asyncio.CancelledError:
+                        pass
+                all_texts.append(text_chunk)
+                now = asyncio.get_event_loop().time()
+                if now - last_edit_time >= 0.5:
+                    display = "\n\n".join(all_texts)
+                    if len(display) > TELEGRAM_MAX_MESSAGE_LENGTH - 50:
+                        display = "..." + display[-(TELEGRAM_MAX_MESSAGE_LENGTH - 53):]
+                    await safe_edit(reply, md_to_tg(display))
+                    last_edit_time = now
+
+            elif chunk.startswith("\x01ACTION:"):
+                had_actions = True
+                action = chunk[8:]
+                actions.append(action)
+                if len(actions) > 3:
+                    actions = actions[-3:]
+                if not got_first_chunk:
+                    got_first_chunk = True
+                    stop_anim.set()
+                    anim_task.cancel()
+                    try:
+                        await anim_task
+                    except asyncio.CancelledError:
+                        pass
+                now = asyncio.get_event_loop().time()
+                if now - last_edit_time >= 1.0:
+                    elapsed = int(now - start_time)
+                    display = f"⚙️ Работаю... ({elapsed}s)\n\n" + "\n".join(f"→ {a}" for a in actions)
+                    if progress_msg is None:
+                        try:
+                            progress_msg = await context.bot.send_message(chat_id=chat_id, text=display)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await progress_msg.edit_text(display)
+                        except Exception:
+                            pass
+                    last_edit_time = now
+
+            elif chunk.startswith("\x01DONE:"):
+                pass
+
+        stop_anim.set()
+        if not anim_task.done():
+            anim_task.cancel()
+
+        if progress_msg:
+            try:
+                await progress_msg.delete()
+            except Exception:
+                pass
+
+        duration = asyncio.get_event_loop().time() - start_time
+        ls = runner.get_last_stats()
+        record_invocation(
+            "callback", runner.get_model(), duration,
+            input_tokens=ls.input_tokens if ls else 0,
+            output_tokens=ls.output_tokens if ls else 0,
+            cache_read=ls.cache_read if ls else 0,
+            cache_creation=ls.cache_creation if ls else 0,
+            cost_usd=ls.cost_usd if ls else 0,
+            context_window=ls.context_window if ls else 0,
+        )
+
+        elapsed = int(duration)
+        done_tag = f"\n\n<i>worked {elapsed}s</i>" if had_actions else (f"\n\n<i>thought {elapsed}s</i>" if elapsed >= 3 else "")
+
+        if all_texts:
+            final = "\n\n".join(all_texts).strip()
+            formatted = md_to_tg(final) + done_tag
+            formatted, keyboard_rows = _extract_buttons(formatted)
+            keyboard = InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
+            chunks = split_message(formatted)
+            if len(chunks) == 1:
+                await safe_edit(reply, chunks[0], reply_markup=keyboard)
+            else:
+                await safe_edit(reply, chunks[0])
+                for ch in chunks[1:-1]:
+                    await safe_send(context.bot, chat_id, ch)
+                await safe_send(context.bot, chat_id, chunks[-1], reply_markup=keyboard)
+        elif had_actions:
+            await safe_edit(reply, f"<i>worked {elapsed}s</i>")
+        else:
+            await safe_edit(reply, "[Пустой ответ]", use_html=False)
+
+    except asyncio.CancelledError:
+        stop_anim.set()
+        try:
+            await reply.edit_text("[Отменено]")
+        except Exception:
+            pass
+    except Exception as e:
+        stop_anim.set()
+        logger.exception("Error processing callback")
         try:
             await reply.edit_text(f"Ошибка: {e}")
         except Exception:
@@ -889,6 +1091,7 @@ def main():
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(CallbackQueryHandler(handle_callback))
 
     logger.info("Starting Claude Code Telegram Bridge...")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
