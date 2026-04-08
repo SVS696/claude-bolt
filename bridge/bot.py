@@ -749,17 +749,18 @@ async def _process_message(update: Update, context: ContextTypes.DEFAULT_TYPE, m
         )
 
         # Final output
-        # Reply always shows all TEXT blocks (already updated live).
-        # Just do a final edit to ensure formatting is clean.
+        elapsed = int(duration)
+        done_tag = f"\n\n<i>worked {elapsed}s</i>" if had_actions else (f"\n\n<i>thought {elapsed}s</i>" if elapsed >= 3 else "")
+
         if all_texts:
             final = "\n\n".join(all_texts).strip()
-            formatted = md_to_tg(final)
+            formatted = md_to_tg(final) + done_tag
             chunks = split_message(formatted)
             await safe_edit(reply, chunks[0])
             for ch in chunks[1:]:
                 await safe_send(context.bot, chat_id, ch)
         elif had_actions:
-            await safe_edit(reply, "✅ Выполнено", use_html=False)
+            await safe_edit(reply, f"<i>worked {elapsed}s</i>")
         else:
             await safe_edit(reply, "[Пустой ответ]", use_html=False)
 
